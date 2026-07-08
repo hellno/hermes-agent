@@ -2744,17 +2744,78 @@ def check_all_command_guards(command: str, env_type: str,
     if approval_mode == "smart":
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
+        # Observability: smart-mode auto approve/deny ARE approval decisions,
+        # so fire the same pre/post hooks the manual and gateway surfaces fire
+        # -- otherwise every approval observer (nemo_relay, notifiers, audit)
+        # silently misses them. Pure observers: _fire_approval_hook swallows
+        # all errors, so these never change the verdict, the return value, or
+        # the approve_session ordering below. surface="smart" and the smart_*
+        # choices are additive, so existing observers keep working.
+        #
+        # Redact the observer-facing payload: smart mode is orthogonal to
+        # CLI-vs-gateway, so this same branch runs in gateway (Discord/Slack)
+        # sessions where the payload can be forwarded to a screenshottable
+        # surface. Matches the gateway/escalate path (redacts via approval_data)
+        # and the execute_code smart site. The raw `command` is still what
+        # _smart_approve assessed and what executes; redaction is display-only
+        # and the returned dict below keeps the raw description unchanged.
+        #
+        # This is the only redact call on the smart approve/deny path and it
+        # exists PURELY to feed the observer hooks, so guard it too: the whole
+        # observer step must never break the safety-critical approve/deny
+        # decision (same fail-open contract as _fire_approval_hook). Falls back
+        # to a fixed sentinel so a pathological redact failure can never leak
+        # the raw command to observers either.
+        try:
+            from agent.redact import redact_sensitive_text
+            _hook_command = redact_sensitive_text(command)
+            _hook_desc = redact_sensitive_text(combined_desc_for_llm)
+        except Exception:
+            _hook_command = _hook_desc = "<redaction-failed>"
+        _primary_key = warnings[0][0]
+        _all_keys = [key for key, _, _ in warnings]
+        if verdict in ("approve", "deny"):
+            _fire_approval_hook(
+                "pre_approval_request",
+                command=_hook_command,
+                description=_hook_desc,
+                pattern_key=_primary_key,
+                pattern_keys=_all_keys,
+                session_key=session_key,
+                surface="smart",
+            )
         if verdict == "approve":
             # Auto-approve and grant session-level approval for these patterns
             for key, _, _ in warnings:
                 approve_session(session_key, key)
             logger.debug("Smart approval: auto-approved '%s' (%s)",
                          command[:60], combined_desc_for_llm)
+            _fire_approval_hook(
+                "post_approval_response",
+                command=_hook_command,
+                description=_hook_desc,
+                pattern_key=_primary_key,
+                pattern_keys=_all_keys,
+                session_key=session_key,
+                surface="smart",
+                choice="smart_approve",
+                decided_by="aux_llm",
+            )
             return {"approved": True, "message": None,
                     "smart_approved": True,
                     "description": combined_desc_for_llm}
         elif verdict == "deny":
-            combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
+            _fire_approval_hook(
+                "post_approval_response",
+                command=_hook_command,
+                description=_hook_desc,
+                pattern_key=_primary_key,
+                pattern_keys=_all_keys,
+                session_key=session_key,
+                surface="smart",
+                choice="smart_deny",
+                decided_by="aux_llm",
+            )
             return {
                 "approved": False,
                 "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
@@ -3048,12 +3109,51 @@ def check_execute_code_guard(code: str, env_type: str,
     # guards (restored by context propagation) still run independently.
     if approval_mode == "smart":
         verdict = _smart_approve(command, description)
+        # Observability: fire the same pre/post approval hooks the gateway
+        # surface fires, so plugins see smart-mode execute_code decisions too
+        # (not just escalations). Pure observers -- _fire_approval_hook
+        # swallows all errors, so the verdict and return value are unchanged.
+        # The payload uses the redacted display copies, matching the
+        # execute_code gateway path (an execute_code script can embed
+        # secrets that get forwarded to observers). surface="smart".
+        if verdict in ("approve", "deny"):
+            _fire_approval_hook(
+                "pre_approval_request",
+                command=display_command,
+                description=display_description,
+                pattern_key=pattern_key,
+                pattern_keys=[pattern_key],
+                session_key=session_key,
+                surface="smart",
+            )
         if verdict == "approve":
             logger.debug("Smart approval: auto-approved execute_code for session %s",
                          session_key)
+            _fire_approval_hook(
+                "post_approval_response",
+                command=display_command,
+                description=display_description,
+                pattern_key=pattern_key,
+                pattern_keys=[pattern_key],
+                session_key=session_key,
+                surface="smart",
+                choice="smart_approve",
+                decided_by="aux_llm",
+            )
             return {"approved": True, "message": None,
                     "smart_approved": True, "description": description}
         if verdict == "deny":
+            _fire_approval_hook(
+                "post_approval_response",
+                command=display_command,
+                description=display_description,
+                pattern_key=pattern_key,
+                pattern_keys=[pattern_key],
+                session_key=session_key,
+                surface="smart",
+                choice="smart_deny",
+                decided_by="aux_llm",
+            )
             return {
                 "approved": False,
                 "message": ("BLOCKED by smart approval: execute_code script "
